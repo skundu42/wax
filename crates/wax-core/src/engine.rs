@@ -163,13 +163,12 @@ impl Engine {
             .squeeze(0)?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
-        let mut index_pos = prompt_tokens;
         let mut generated_tokens = 0usize;
         let mut ttft_ms = None;
         let mut decode_forward_secs = 0.0f64;
         let mut stop_reason = StopReason::MaxTokens;
 
-        for step in 0..request.max_new_tokens {
+        for (step, index_pos) in (0..request.max_new_tokens).zip(prompt_tokens..) {
             let next_token = sampler.sample(&logits, &all_tokens)?;
             generated_tokens += 1;
 
@@ -200,7 +199,6 @@ impl Engine {
                 .forward(&input, index_pos, cache.as_mut())?
                 .squeeze(0)?;
             decode_forward_secs += decode_start.elapsed().as_secs_f64();
-            index_pos += 1;
         }
 
         if request.stream {
