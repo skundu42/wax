@@ -1,0 +1,88 @@
+name: Publish crates
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish crates.io release
+    runs-on: ubuntu-latest
+    if: github.event.release.target_commitish == 'main'
+    environment: crates.io
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release tag matches workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "wax-core") | .version')"
+          expected="v${version}"
+          actual="${{ github.event.release.tag_name }}"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "Release tag must match workspace version."
+            echo "Expected: ${expected}"
+            echo "Actual:   ${actual}"
+            exit 1
+          fi
+
+      - name: Run release checks
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+          cargo test --workspace --no-default-features
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "wax-core") | .version')"
+
+          crate_published() {
+            local crate="$1"
+            curl -fsS "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null
+          }
+
+          wait_for_crate() {
+            local crate="$1"
+            for _ in {1..30}; do
+              if crate_published "${crate}"; then
+                echo "${crate} ${version} is visible in crates.io"
+                return 0
+              fi
+              sleep 10
+            done
+            echo "Timed out waiting for ${crate} ${version} to appear in crates.io"
+            exit 1
+          }
+
+          publish_crate() {
+            local crate="$1"
+            if crate_published "${crate}"; then
+              echo "${crate} ${version} is already published; skipping"
+              return 0
+            fi
+
+            cargo publish -p "${crate}" --locked --dry-run
+            cargo publish -p "${crate}" --locked
+          }
+
+          publish_crate wax-core
+          wait_for_crate wax-core
+
+          publish_crate wax-bench
+          publish_crate wax-llm

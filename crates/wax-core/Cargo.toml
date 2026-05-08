@@ -1,0 +1,41 @@
+[package]
+name = "wax-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core inference engine for wax, a small Candle-based local LLM runner"
+documentation = "https://docs.rs/wax-core"
+readme = "../../README.md"
+
+[features]
+default = []
+accelerate = [
+    "candle-core/accelerate",
+    "candle-nn/accelerate",
+    "candle-transformers/accelerate",
+]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+]
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+safetensors.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ahash.workspace = true
+tempfile.workspace = true

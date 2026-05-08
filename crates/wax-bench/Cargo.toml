@@ -1,0 +1,11 @@
+[package]
+name = "wax-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmark types and helpers for wax"
+documentation = "https://docs.rs/wax-bench"
+readme = "../../README.md"
+
+[dependencies]
+wax-core = { path = "../wax-core", version = "0.1.0" }
