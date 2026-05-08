@@ -1,6 +1,13 @@
 # Rust build output
 /target/
 
+# JavaScript/Next.js build output
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
 # Local model downloads and generated assets
 /models/
 
@@ -8,6 +15,8 @@
 .env
 .env.*
 !.env.example
+.env.local
+.env.*.local
 
 # OS/editor files
 .DS_Store
@@ -19,5 +28,9 @@
 
 # Logs and temporary files
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 /tmp/
 /.cache/

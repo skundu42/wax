@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -8,10 +8,11 @@ use std::{
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use wax_core::{
     stats::{BenchStats, CANDLE_VERSION},
-    DTypeChoice, DeviceChoice, Engine, EngineConfig, GenerateRequest, Result as WaxResult,
-    SamplingConfig,
+    ChatMessage, ChatTemplate, DTypeChoice, DeviceChoice, Engine, EngineConfig, GenerateOutput,
+    GenerateRequest, Result as WaxResult, SamplingConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -28,6 +29,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Run(RunArgs),
+    Chat(ChatArgs),
     Bench(BenchArgs),
 }
 
@@ -37,7 +39,13 @@ struct RunArgs {
     model: PathBuf,
 
     #[arg(long)]
-    prompt: String,
+    prompt: Option<String>,
+
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    #[arg(long)]
+    stdin: bool,
 
     #[arg(long, default_value_t = 64)]
     max_new_tokens: usize,
@@ -62,6 +70,72 @@ struct RunArgs {
 
     #[arg(long, default_value_t = true)]
     stream: bool,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    output_file: Option<PathBuf>,
+
+    #[arg(long)]
+    stop: Vec<String>,
+
+    #[arg(long = "eos-token-id")]
+    eos_token_ids: Vec<u32>,
+
+    #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
+    device: DeviceArg,
+
+    #[arg(long, value_enum, default_value_t = DTypeArg::Auto)]
+    dtype: DTypeArg,
+}
+
+#[derive(Debug, Parser)]
+struct ChatArgs {
+    #[arg(long)]
+    model: PathBuf,
+
+    #[arg(long)]
+    system: Option<String>,
+
+    #[arg(long = "message")]
+    messages: Vec<String>,
+
+    #[arg(long, default_value_t = 128)]
+    max_new_tokens: usize,
+
+    #[arg(long, default_value_t = 0.7)]
+    temperature: f64,
+
+    #[arg(long)]
+    top_k: Option<usize>,
+
+    #[arg(long)]
+    top_p: Option<f64>,
+
+    #[arg(long, default_value_t = 1.0)]
+    repetition_penalty: f32,
+
+    #[arg(long, default_value_t = 128)]
+    repeat_last_n: usize,
+
+    #[arg(long, default_value_t = 299_792_458)]
+    seed: u64,
+
+    #[arg(long, default_value_t = true)]
+    stream: bool,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    output_file: Option<PathBuf>,
+
+    #[arg(long)]
+    stop: Vec<String>,
+
+    #[arg(long = "eos-token-id")]
+    eos_token_ids: Vec<u32>,
 
     #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
     device: DeviceArg,
@@ -132,15 +206,17 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run(args) => run(args),
+        Commands::Chat(args) => chat(args),
         Commands::Bench(args) => bench(args),
     }
 }
 
 fn run(args: RunArgs) -> anyhow::Result<()> {
+    let prompt = prompt_from_args(args.prompt, args.prompt_file, args.stdin)?;
     let mut engine = Engine::load(engine_config(&args.model, args.device, args.dtype))
         .with_context(|| format!("failed to load model from {}", args.model.display()))?;
     let request = GenerateRequest {
-        prompt: args.prompt,
+        prompt,
         max_new_tokens: args.max_new_tokens,
         sampling: sampling_config(
             args.temperature,
@@ -150,18 +226,57 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
             args.repeat_last_n,
             args.seed,
         ),
-        stream: args.stream,
+        stream: args.stream && !args.json,
+        stop: args.stop,
+        eos_token_ids: args.eos_token_ids,
+        add_special_tokens: true,
     };
 
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    let stats = engine.generate(request, |delta: &str| -> WaxResult<()> {
-        write!(handle, "{delta}")?;
-        handle.flush()?;
-        Ok(())
-    })?;
-    writeln!(handle)?;
-    eprintln!("{}", serde_json::to_string_pretty(&stats)?);
+    let printed_stream = request.stream;
+    let output = generate_to_stdout(&mut engine, request, args.json)?;
+    write_output_file(args.output_file, &output.text)?;
+    print_run_output(&output, args.json, printed_stream)?;
+    Ok(())
+}
+
+fn chat(args: ChatArgs) -> anyhow::Result<()> {
+    if args.messages.is_empty() {
+        anyhow::bail!("at least one --message is required");
+    }
+
+    let mut messages = Vec::with_capacity(args.messages.len() + usize::from(args.system.is_some()));
+    if let Some(system) = args.system {
+        messages.push(ChatMessage::new("system", system));
+    }
+    messages.extend(args.messages.into_iter().map(parse_chat_message));
+
+    let template = ChatTemplate::load_for_model_path(&args.model)
+        .with_context(|| format!("failed to load chat template for {}", args.model.display()))?;
+    let prompt = template.render(&messages, true)?;
+
+    let mut engine = Engine::load(engine_config(&args.model, args.device, args.dtype))
+        .with_context(|| format!("failed to load model from {}", args.model.display()))?;
+    let request = GenerateRequest {
+        prompt,
+        max_new_tokens: args.max_new_tokens,
+        sampling: sampling_config(
+            args.temperature,
+            args.top_k,
+            args.top_p,
+            args.repetition_penalty,
+            args.repeat_last_n,
+            args.seed,
+        ),
+        stream: args.stream && !args.json,
+        stop: args.stop,
+        eos_token_ids: args.eos_token_ids,
+        add_special_tokens: false,
+    };
+
+    let printed_stream = request.stream;
+    let output = generate_to_stdout(&mut engine, request, args.json)?;
+    write_output_file(args.output_file, &output.text)?;
+    print_run_output(&output, args.json, printed_stream)?;
     Ok(())
 }
 
@@ -180,7 +295,7 @@ fn bench(args: BenchArgs) -> anyhow::Result<()> {
 
     let mut results = Vec::with_capacity(args.runs);
     for _ in 0..args.runs {
-        let stats = engine.generate(
+        let output = engine.generate(
             GenerateRequest {
                 prompt: prompt.clone(),
                 max_new_tokens: args.max_new_tokens,
@@ -193,10 +308,13 @@ fn bench(args: BenchArgs) -> anyhow::Result<()> {
                     args.seed,
                 ),
                 stream: false,
+                stop: Vec::new(),
+                eos_token_ids: Vec::new(),
+                add_special_tokens: true,
             },
             noop_stream,
         )?;
-        results.push(stats);
+        results.push(output.stats);
     }
 
     let first = results
@@ -243,6 +361,102 @@ fn engine_config(model: &Path, device: DeviceArg, dtype: DTypeArg) -> EngineConf
         model_dir: model.to_path_buf(),
         device: device.into(),
         dtype: dtype.into(),
+    }
+}
+
+fn prompt_from_args(
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    read_stdin: bool,
+) -> anyhow::Result<String> {
+    let selected = usize::from(prompt.is_some())
+        + usize::from(prompt_file.is_some())
+        + usize::from(read_stdin);
+    if selected > 1 {
+        anyhow::bail!("provide only one of --prompt, --prompt-file, or --stdin");
+    }
+
+    if let Some(prompt) = prompt {
+        return Ok(prompt);
+    }
+    if let Some(path) = prompt_file {
+        return fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()));
+    }
+    if read_stdin {
+        let mut prompt = String::new();
+        io::stdin().read_to_string(&mut prompt)?;
+        return Ok(prompt);
+    }
+
+    anyhow::bail!("provide --prompt, --prompt-file, or --stdin")
+}
+
+fn parse_chat_message(message: String) -> ChatMessage {
+    if let Some((role, content)) = message.split_once(':') {
+        if matches!(role, "system" | "user" | "assistant" | "tool") {
+            return ChatMessage::new(role, content);
+        }
+    }
+    ChatMessage::new("user", message)
+}
+
+fn generate_to_stdout(
+    engine: &mut Engine,
+    request: GenerateRequest,
+    suppress_stream: bool,
+) -> anyhow::Result<GenerateOutput> {
+    let should_stream = request.stream && !suppress_stream;
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let output = engine.generate(request, |delta: &str| -> WaxResult<()> {
+        if should_stream {
+            write!(handle, "{delta}")?;
+            handle.flush()?;
+        }
+        Ok(())
+    })?;
+    if should_stream {
+        writeln!(handle)?;
+    }
+    Ok(output)
+}
+
+fn write_output_file(path: Option<PathBuf>, text: &str) -> anyhow::Result<()> {
+    if let Some(path) = path {
+        fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn print_run_output(
+    output: &GenerateOutput,
+    json: bool,
+    already_streamed: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&RunOutputJson::from(output))?
+        );
+    } else if !already_streamed {
+        println!("{}", output.text);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct RunOutputJson<'a> {
+    text: &'a str,
+    stats: &'a wax_core::stats::GenerateStats,
+}
+
+impl<'a> From<&'a GenerateOutput> for RunOutputJson<'a> {
+    fn from(output: &'a GenerateOutput) -> Self {
+        Self {
+            text: &output.text,
+            stats: &output.stats,
+        }
     }
 }
 

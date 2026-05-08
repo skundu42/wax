@@ -19,6 +19,7 @@ pub struct GenerateStats {
 pub enum StopReason {
     Eos,
     MaxTokens,
+    StopSequence,
 }
 
 #[derive(Debug, Clone, Serialize)]

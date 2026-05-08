@@ -20,6 +20,7 @@ metal = ["wax-core/metal"]
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
 wax-core = { path = "../wax-core", version = "0.1.0" }

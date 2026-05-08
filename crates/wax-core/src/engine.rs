@@ -20,7 +20,6 @@ use crate::{
     loader::{resolve_model_source, ModelConfig, ModelSource},
     sampler::{Sampler, SamplingConfig},
     stats::{GenerateStats, StopReason},
-    token_stream::TokenOutputStream,
     DTypeChoice, DeviceChoice, Result, WaxError,
 };
 
@@ -60,6 +59,9 @@ pub struct GenerateRequest {
     pub max_new_tokens: usize,
     pub sampling: SamplingConfig,
     pub stream: bool,
+    pub stop: Vec<String>,
+    pub eos_token_ids: Vec<u32>,
+    pub add_special_tokens: bool,
 }
 
 impl Default for GenerateRequest {
@@ -69,8 +71,17 @@ impl Default for GenerateRequest {
             max_new_tokens: 64,
             sampling: SamplingConfig::default(),
             stream: true,
+            stop: Vec::new(),
+            eos_token_ids: Vec::new(),
+            add_special_tokens: true,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerateOutput {
+    pub text: String,
+    pub stats: GenerateStats,
 }
 
 pub struct Engine {
@@ -134,12 +145,12 @@ impl Engine {
         &mut self,
         request: GenerateRequest,
         mut stream: S,
-    ) -> Result<GenerateStats> {
+    ) -> Result<GenerateOutput> {
         validate_generate_request(&request)?;
 
         let mut all_tokens = self
             .tokenizer
-            .encode(request.prompt.as_str(), true)
+            .encode(request.prompt.as_str(), request.add_special_tokens)
             .map_err(WaxError::tokenizer)?
             .get_ids()
             .to_vec();
@@ -152,7 +163,9 @@ impl Engine {
         let prompt_tokens = all_tokens.len();
         let mut cache = self.backend.new_cache(self.dtype, &self.device)?;
         let mut sampler = Sampler::new(request.sampling)?;
-        let mut output = TokenOutputStream::new(self.tokenizer.clone());
+        let mut generated_token_ids = Vec::with_capacity(request.max_new_tokens);
+        let mut generated_text = String::new();
+        let mut emitted_len = 0usize;
 
         let total_start = Instant::now();
         let prefill_start = Instant::now();
@@ -177,15 +190,37 @@ impl Engine {
             }
 
             all_tokens.push(next_token);
-            if self.is_eos(next_token) {
+            if self.is_eos(next_token, &request.eos_token_ids) {
                 stop_reason = StopReason::Eos;
                 break;
             }
 
-            if request.stream {
-                if let Some(delta) = output.next_token(next_token)? {
-                    stream.token(&delta)?;
-                }
+            generated_token_ids.push(next_token);
+            let decoded = self
+                .tokenizer
+                .decode(&generated_token_ids, true)
+                .map_err(WaxError::tokenizer)?;
+            let (next_text, hit_stop) = apply_stop_sequences(&decoded, &request.stop);
+            generated_text = next_text;
+
+            let target_emit_len = if hit_stop {
+                generated_text.len()
+            } else {
+                streamable_len(&generated_text, &request.stop)
+            };
+            if request.stream && target_emit_len > emitted_len {
+                let delta = generated_text
+                    .get(emitted_len..target_emit_len)
+                    .ok_or_else(|| {
+                        WaxError::InvalidRequest("invalid UTF-8 stream boundary".to_string())
+                    })?;
+                stream.token(delta)?;
+                emitted_len = target_emit_len;
+            }
+
+            if hit_stop {
+                stop_reason = StopReason::StopSequence;
+                break;
             }
 
             if step + 1 == request.max_new_tokens {
@@ -201,10 +236,14 @@ impl Engine {
             decode_forward_secs += decode_start.elapsed().as_secs_f64();
         }
 
-        if request.stream {
-            if let Some(rest) = output.decode_rest()? {
-                stream.token(&rest)?;
-            }
+        if request.stream
+            && stop_reason != StopReason::StopSequence
+            && generated_text.len() > emitted_len
+        {
+            let delta = generated_text.get(emitted_len..).ok_or_else(|| {
+                WaxError::InvalidRequest("invalid UTF-8 stream boundary".to_string())
+            })?;
+            stream.token(delta)?;
         }
 
         let decode_tok_s = if generated_tokens > 1 && decode_forward_secs > 0.0 {
@@ -213,23 +252,46 @@ impl Engine {
             None
         };
 
-        Ok(GenerateStats {
-            model: self.model_name.clone(),
-            device: self.device_label(),
-            dtype: self.dtype_label(),
-            prompt_tokens,
-            generated_tokens,
-            prefill_ms,
-            ttft_ms,
-            decode_tok_s,
-            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
-            stop_reason,
+        Ok(GenerateOutput {
+            text: generated_text,
+            stats: GenerateStats {
+                model: self.model_name.clone(),
+                device: self.device_label(),
+                dtype: self.dtype_label(),
+                prompt_tokens,
+                generated_tokens,
+                prefill_ms,
+                ttft_ms,
+                decode_tok_s,
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                stop_reason,
+            },
         })
     }
 
-    fn is_eos(&self, token: u32) -> bool {
-        self.eos_token_ids.contains(&token)
+    fn is_eos(&self, token: u32, extra_eos_token_ids: &[u32]) -> bool {
+        self.eos_token_ids.contains(&token) || extra_eos_token_ids.contains(&token)
     }
+}
+
+fn apply_stop_sequences(text: &str, stops: &[String]) -> (String, bool) {
+    let stop_at = stops.iter().filter_map(|stop| text.find(stop)).min();
+    match stop_at {
+        Some(index) => (text[..index].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+fn streamable_len(text: &str, stops: &[String]) -> usize {
+    let mut hold_len = 0usize;
+    for stop in stops {
+        for (prefix_len, _) in stop.char_indices().skip(1) {
+            if text.ends_with(&stop[..prefix_len]) {
+                hold_len = hold_len.max(prefix_len);
+            }
+        }
+    }
+    text.len().saturating_sub(hold_len)
 }
 
 impl ModelBackend {
@@ -378,6 +440,11 @@ fn validate_generate_request(request: &GenerateRequest) -> Result<()> {
             "max-new-tokens must be > 0".to_string(),
         ));
     }
+    if request.stop.iter().any(|stop| stop.is_empty()) {
+        return Err(WaxError::InvalidRequest(
+            "stop strings must not be empty".to_string(),
+        ));
+    }
     request.sampling.validate()
 }
 
@@ -405,6 +472,9 @@ mod tests {
             max_new_tokens: 1,
             sampling: SamplingConfig::default(),
             stream: true,
+            stop: Vec::new(),
+            eos_token_ids: Vec::new(),
+            add_special_tokens: true,
         })
         .unwrap_err();
 
@@ -425,5 +495,29 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
 
         assert_eq!(super::model_display_name(&file), "model-q8_0");
+    }
+
+    #[test]
+    fn stop_sequence_truncates_at_earliest_match() {
+        let (text, stopped) = super::apply_stop_sequences(
+            "hello <stop> ignored",
+            &["ignored".to_string(), "<stop>".to_string()],
+        );
+
+        assert!(stopped);
+        assert_eq!(text, "hello ");
+    }
+
+    #[test]
+    fn streamable_len_holds_possible_stop_prefix() {
+        assert_eq!(
+            super::streamable_len("hello <st", &["<stop>".to_string()]),
+            6
+        );
+        assert_eq!(super::streamable_len("hello <", &["<stop>".to_string()]), 6);
+        assert_eq!(
+            super::streamable_len("hello world", &["<stop>".to_string()]),
+            "hello world".len()
+        );
     }
 }

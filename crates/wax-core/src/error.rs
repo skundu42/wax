@@ -16,6 +16,9 @@ pub enum WaxError {
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
 
+    #[error("chat template error: {0}")]
+    Template(String),
+
     #[error("unsupported architecture: {architecture}. This engine currently supports only Llama-like causal LM models.")]
     UnsupportedArchitecture { architecture: String },
 
@@ -38,5 +41,9 @@ pub enum WaxError {
 impl WaxError {
     pub(crate) fn tokenizer(err: impl std::fmt::Display) -> Self {
         Self::Tokenizer(err.to_string())
+    }
+
+    pub(crate) fn template(err: impl std::fmt::Display) -> Self {
+        Self::Template(err.to_string())
     }
 }

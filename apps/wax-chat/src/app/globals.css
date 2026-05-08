@@ -1,0 +1,76 @@
+:root {
+  --background: #101110;
+  --panel: #1b1c1b;
+  --panel-strong: #252724;
+  --text: #f4f1e8;
+  --muted: #9eaa9d;
+  --line: #343a34;
+  --accent: #b8f36d;
+  --accent-strong: #d9ff8f;
+  --blue: #69a4ff;
+  --amber: #f1bd5f;
+  --danger: #ff7a7a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+    var(--background);
+  background-size: 28px 28px;
+  color: var(--text);
+  font-family:
+    "Avenir Next", "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 1px solid var(--line);
+  background: var(--panel-strong);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0d0e0d;
+  color: var(--text);
+  outline: none;
+}
+
+input[type="range"] {
+  accent-color: var(--accent);
+}
+
+input:focus,
+textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(184, 243, 109, 0.16);
+}
+
+::selection {
+  background: rgba(184, 243, 109, 0.28);
+}
